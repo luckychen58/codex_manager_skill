@@ -76,6 +76,19 @@ One-shot evaluation is also supported:
 python scripts/codex_manager.py manage-cliproxy --workspace C:\path\to\workspace --project C:\path\to\project --once
 ```
 
+## Windows Launchers
+
+Portable Windows launcher templates are included in `windows-launchers/`.
+
+- `windows-launchers\start-codex-manager.cmd`: start the background account manager
+- `windows-launchers\stop-codex-manager.cmd`: stop the background account manager
+- `windows-launchers\rotate-codex-manager.cmd`: double-click to force an immediate rotation to the next healthy account
+- `windows-launchers\codex-manager.cmd`: direct command wrapper for snapshot, watch, manage, and force-switch operations
+
+Copy the `windows-launchers` folder into a workspace, or run the PowerShell launchers with an explicit `-Workspace` argument.
+
+They look for the installed skill at `%USERPROFILE%\.codex\skills\codex-manager` first and fall back to the local clone when run from the repository.
+
 ## Recommended Workflow
 
 1. Start work with `$codex-manager`.

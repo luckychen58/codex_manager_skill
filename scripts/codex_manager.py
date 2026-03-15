@@ -656,7 +656,7 @@ def find_candidate(candidates: list[dict], name: str) -> dict | None:
     return None
 
 
-def select_next_candidate(candidates: list[dict], current_name: str) -> dict | None:
+def select_next_candidate(candidates: list[dict], current_name: str, allow_current_fallback: bool = True) -> dict | None:
     healthy = [candidate for candidate in candidates if candidate_is_healthy(candidate)]
     if not healthy:
         return None
@@ -675,17 +675,19 @@ def select_next_candidate(candidates: list[dict], current_name: str) -> dict | N
     for offset in range(1, len(candidates) + 1):
         candidate = candidates[(current_index + offset) % len(candidates)]
         if candidate_is_healthy(candidate):
+            if not allow_current_fallback and str(candidate.get("name") or "").strip() == current_name:
+                continue
             return candidate
     return None
 
 
-def ensure_managed_record(state: dict, candidate: dict) -> dict:
+def ensure_managed_record(state: dict, candidate: dict, default_original_priority: int | None = None) -> dict:
     managed = state.setdefault("managed", {})
     name = str(candidate.get("name") or "").strip()
     record = managed.get(name)
     if not isinstance(record, dict):
         record = {
-            "original_priority": int(candidate.get("priority") or 0),
+            "original_priority": int(default_original_priority if default_original_priority is not None else (candidate.get("priority") or 0)),
             "id": str(candidate.get("id") or ""),
             "provider": str(candidate.get("provider") or ""),
             "email": str(candidate.get("email") or ""),
@@ -701,28 +703,49 @@ def append_switch_history(state: dict, entry: dict) -> None:
         del history[:-20]
 
 
+def sync_candidate_priorities(
+    args: argparse.Namespace,
+    management_key: str,
+    state: dict,
+    candidates: list[dict],
+    selected_name: str,
+) -> list[str]:
+    target_priority = int(args.selected_priority)
+    updates: list[str] = []
+    for candidate in candidates:
+        name = str(candidate.get("name") or "").strip()
+        if not name:
+            continue
+
+        current_priority = int(candidate.get("priority") or 0)
+        default_original_priority = 0 if current_priority == target_priority else None
+        record = ensure_managed_record(state, candidate, default_original_priority=default_original_priority)
+
+        if name == selected_name:
+            desired_priority = target_priority
+        else:
+            desired_priority = int(record.get("original_priority", 0) or 0)
+
+        if current_priority != desired_priority:
+            patch_auth_priority(args.base_url, management_key, name, desired_priority)
+            candidate["priority"] = desired_priority
+            updates.append(f"{candidate_display_name(candidate)} -> {desired_priority}")
+
+    return updates
+
+
 def apply_selected_candidate(
     args: argparse.Namespace,
     management_key: str,
     state: dict,
+    candidates: list[dict],
     current_candidate: dict | None,
     selected_candidate: dict,
     reason: str,
 ) -> str:
     selected_name = str(selected_candidate.get("name") or "").strip()
     previous_name = str(state.get("selected_name") or "").strip()
-    ensure_managed_record(state, selected_candidate)
-
-    if previous_name and previous_name != selected_name:
-        previous_record = state.get("managed", {}).get(previous_name)
-        if isinstance(previous_record, dict):
-            restore_priority = int(previous_record.get("original_priority", 0) or 0)
-            patch_auth_priority(args.base_url, management_key, previous_name, restore_priority)
-
-    target_priority = int(args.selected_priority)
-    if int(selected_candidate.get("priority") or 0) != target_priority:
-        patch_auth_priority(args.base_url, management_key, selected_name, target_priority)
-        selected_candidate["priority"] = target_priority
+    sync_candidate_priorities(args, management_key, state, candidates, selected_name)
 
     switched_at = snapshot_now()
     state["selected_name"] = selected_name
@@ -763,12 +786,12 @@ def manage_cliproxy(args: argparse.Namespace) -> int:
         return 1
 
     state_path = resolve_state_path(args, provider)
-    state = load_switch_state(state_path, provider)
     print(f"Managing CLIProxyAPI provider '{provider}' via {args.base_url.rstrip('/')}")
     print(f"Switch state file: {state_path}")
 
     while True:
         try:
+            state = load_switch_state(state_path, provider)
             auth_files = fetch_auth_files(args.base_url, management_key)
             candidates = enrich_auth_files(args, auth_files, provider, management_key)
             if not candidates:
@@ -782,12 +805,9 @@ def manage_cliproxy(args: argparse.Namespace) -> int:
             current_candidate = find_candidate(candidates, current_name) if current_name else None
 
             if current_candidate and candidate_is_healthy(current_candidate):
-                ensure_managed_record(state, current_candidate)
-                target_priority = int(args.selected_priority)
-                if int(current_candidate.get("priority") or 0) != target_priority:
-                    patch_auth_priority(args.base_url, management_key, current_name, target_priority)
-                    current_candidate["priority"] = target_priority
-                    print(f"Pinned current auth '{candidate_display_name(current_candidate)}' to priority {target_priority}.")
+                priority_updates = sync_candidate_priorities(args, management_key, state, candidates, current_name)
+                if priority_updates:
+                    print("Normalized priorities: " + " | ".join(priority_updates))
                 save_switch_state(state_path, state)
                 if args.once:
                     print(f"Current auth remains healthy: {candidate_display_name(current_candidate)}")
@@ -821,7 +841,7 @@ def manage_cliproxy(args: argparse.Namespace) -> int:
                 time.sleep(args.poll_seconds)
                 continue
 
-            switch_message = apply_selected_candidate(args, management_key, state, current_candidate, next_candidate, reason)
+            switch_message = apply_selected_candidate(args, management_key, state, candidates, current_candidate, next_candidate, reason)
             print(switch_message)
             if args.snapshot_on_switch:
                 write_snapshot(args, trigger_note=switch_message)
@@ -846,6 +866,77 @@ def manage_cliproxy(args: argparse.Namespace) -> int:
                 return 1
 
         time.sleep(args.poll_seconds)
+
+
+def force_switch_cliproxy(args: argparse.Namespace) -> int:
+    provider = args.provider_name.strip().lower()
+    management_key = get_management_key(args)
+    if not management_key:
+        print(
+            "ERROR: Missing management key. Set CLIPROXY_MANAGEMENT_KEY or pass --management-key.",
+            file=sys.stderr,
+        )
+        return 1
+
+    state_path = resolve_state_path(args, provider)
+    state = load_switch_state(state_path, provider)
+    print(f"Forcing CLIProxyAPI rotation for provider '{provider}' via {args.base_url.rstrip('/')}")
+    print(f"Switch state file: {state_path}")
+
+    try:
+        auth_files = fetch_auth_files(args.base_url, management_key)
+        candidates = enrich_auth_files(args, auth_files, provider, management_key)
+        if not candidates:
+            print(f"No auth files found for provider '{provider}'.", file=sys.stderr)
+            return 1
+
+        current_name = str(state.get("selected_name") or "").strip()
+        current_candidate = find_candidate(candidates, current_name) if current_name else None
+        next_candidate = select_next_candidate(candidates, current_name, allow_current_fallback=False)
+
+        if next_candidate is None:
+            if current_candidate and candidate_is_healthy(current_candidate):
+                print(
+                    f"No alternate healthy {provider} auth available; current auth remains {candidate_display_name(current_candidate)}.",
+                    file=sys.stderr,
+                )
+                return 1
+
+            unavailable_reasons = []
+            for candidate in candidates:
+                candidate_reason = candidate_problem_reasons(candidate)
+                unavailable_reasons.append(
+                    f"{candidate_display_name(candidate)} -> {', '.join(candidate_reason) if candidate_reason else 'not eligible'}"
+                )
+            print(
+                f"No alternate healthy {provider} auth available. " + " | ".join(unavailable_reasons),
+                file=sys.stderr,
+            )
+            return 1
+
+        switch_message = apply_selected_candidate(
+            args,
+            management_key,
+            state,
+            candidates,
+            current_candidate,
+            next_candidate,
+            "manual forced rotation",
+        )
+        print(switch_message)
+        if args.snapshot_on_switch:
+            write_snapshot(args, trigger_note=switch_message)
+        save_switch_state(state_path, state)
+        return 0
+    except urllib.error.HTTPError as exc:
+        print(f"Management API error: HTTP {exc.code}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as exc:
+        print(f"Management API connection error: {exc.reason}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # pragma: no cover - defensive runtime guard
+        print(f"Force switch error: {exc}", file=sys.stderr)
+        return 1
 
 
 def auth_trigger_reason(auth_file: dict, providers: set[str]) -> str | None:
@@ -969,39 +1060,49 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--cooldown-seconds", type=int, default=300, help="Minimum seconds between duplicate snapshots")
     watch_parser.add_argument("--once", action="store_true", help="Exit after the first trigger or first error")
 
+    def add_manage_cliproxy_args(target: argparse.ArgumentParser) -> None:
+        add_common_snapshot_args(target)
+        target.add_argument("--base-url", default="http://127.0.0.1:8317", help="CLIProxyAPI base URL")
+        target.add_argument("--management-key", help="CLIProxyAPI management key")
+        target.add_argument(
+            "--management-key-env",
+            default="CLIPROXY_MANAGEMENT_KEY",
+            help="Environment variable that stores the management key",
+        )
+        target.add_argument(
+            "--provider-name",
+            default="codex",
+            help="Provider to manage, default: codex",
+        )
+        target.add_argument("--selected-priority", type=int, default=1000, help="Priority assigned to the active auth")
+        target.add_argument("--state-file", help="Persistent manager state path")
+        target.add_argument(
+            "--snapshot-on-switch",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Refresh HANDOFF.md whenever the active auth changes",
+        )
+        target.add_argument(
+            "--snapshot-on-unavailable",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Refresh HANDOFF.md when all managed auths become unavailable",
+        )
+
     manage_parser = subparsers.add_parser(
         "manage-cliproxy",
         help="Promote one CLIProxyAPI auth as the active account and switch to the next healthy account when needed",
     )
-    add_common_snapshot_args(manage_parser)
-    manage_parser.add_argument("--base-url", default="http://127.0.0.1:8317", help="CLIProxyAPI base URL")
-    manage_parser.add_argument("--management-key", help="CLIProxyAPI management key")
-    manage_parser.add_argument(
-        "--management-key-env",
-        default="CLIPROXY_MANAGEMENT_KEY",
-        help="Environment variable that stores the management key",
-    )
-    manage_parser.add_argument(
-        "--provider-name",
-        default="codex",
-        help="Provider to manage, default: codex",
-    )
-    manage_parser.add_argument("--selected-priority", type=int, default=1000, help="Priority assigned to the active auth")
-    manage_parser.add_argument("--state-file", help="Persistent manager state path")
+    add_manage_cliproxy_args(manage_parser)
     manage_parser.add_argument("--poll-seconds", type=int, default=20, help="Polling interval in seconds")
-    manage_parser.add_argument(
-        "--snapshot-on-switch",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Refresh HANDOFF.md whenever the active auth changes",
-    )
-    manage_parser.add_argument(
-        "--snapshot-on-unavailable",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Refresh HANDOFF.md when all managed auths become unavailable",
-    )
     manage_parser.add_argument("--once", action="store_true", help="Evaluate once, switch if needed, then exit")
+
+    force_parser = subparsers.add_parser(
+        "force-switch-cliproxy",
+        aliases=["rotate-cliproxy"],
+        help="Immediately rotate to the next healthy CLIProxyAPI auth even if the current auth is still healthy",
+    )
+    add_manage_cliproxy_args(force_parser)
 
     return parser
 
@@ -1017,6 +1118,8 @@ def main() -> int:
         return watch_cliproxy(args)
     if args.command == "manage-cliproxy":
         return manage_cliproxy(args)
+    if args.command in {"force-switch-cliproxy", "rotate-cliproxy"}:
+        return force_switch_cliproxy(args)
     parser.error(f"Unsupported command: {args.command}")
     return 2
 
