@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Manager"
+  short_description: "Preserve coding context across quota and account switches"
+  default_prompt: "Use $codex-manager to keep this workspace resumable across quota limits or account switches while we continue development."
